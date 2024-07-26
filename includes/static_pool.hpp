@@ -12,68 +12,74 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <boost/lockfree/queue.hpp>
 
 #include "util.hpp"
 
 namespace thread_pool {
 
 class static_pool final
-{ // Simple thread-safe & container-free thread pool.
+{ // Thread-safe & container-free thread pool.
 public:
-    const std::size_t size{0};
+    class task_container_base {
+    public:
+        virtual ~task_container_base() {};
+        virtual void operator()() = 0;
+    };
 
-    explicit static_pool(
-            std::size_t /* suggested size */ = std::thread::hardware_concurrency() + 2);
+    template<typename F>
+    class task_container : public task_container_base {
+    public:
+        task_container(F* f) : f_(f) {};
+        ~task_container() {delete f_; };
+        void operator()() override { (*f_)(); };
+        F* f_;
+    };
+
+    struct pool_src {
+        boost::lockfree::queue<task_container_base*> queue;
+        std::atomic<int> to_finish{0};
+        std::atomic<bool> shutdown{false};
+
+        pool_src(std::size_t capacity) : queue(capacity) {}
+    };
+
+    explicit static_pool(   
+            std::size_t = std::thread::hardware_concurrency(), std::size_t = 1000000);
 
     ~static_pool();
 
     template<typename Func, typename... Args>
-    auto enqueue(Func &&f, Args &&... args) /* For Cpp14+ -> decltype(auto). */
+    auto enqueue(Func &&f, Args &&... args) 
     -> std::future<typename std::result_of<Func(Args...)>::type>;
 
-    //    template <typename Func, typename ... Args>
-    //    auto enqueue_advance(Func &&f, Args &&... args) /* For Cpp14+ ->
-    //    decltype(auto). */
-    //    -> std::future<typename std::result_of<Func(Args...)>::type>;
-    void wait();
+    static bool wait(const std::shared_ptr<pool_src> &ptr);
 
 private:
-    using task_type = std::function<void()>;
-    struct pool_src {
-        std::mutex queue_mu;
-        std::mutex wait_mu;
-        std::condition_variable cv;
-        std::condition_variable wait_cv;
-        std::queue<task_type> queue;
-        std::atomic<int> to_finish{0};
-        std::atomic<bool> shutdown{false};
-    };
+    const std::size_t size{0};
     std::shared_ptr<pool_src> m_shared_src;
 };
 
-
 // Implementation:
-static_pool::static_pool(std::size_t sz)
-        : m_shared_src(std::make_shared<pool_src>()), size(sz) {
+inline static_pool::static_pool(std::size_t sz, std::size_t capacity)
+        : m_shared_src(std::make_shared<pool_src>(capacity)), size(sz)  {
     for (int i = 0; i < sz; ++i) {
         std::thread(
                 [this](std::shared_ptr<pool_src> ptr) {
                     while (true) {
-                        std::function<void()> task;
-                        // >>> Critical region => Begin
-                        {
-                            std::unique_lock<std::mutex> lock(ptr->queue_mu);
-                            ptr->cv.wait(
-                                    lock, [&] { return ptr->shutdown or !ptr->queue.empty(); });
-                            if (ptr->shutdown and ptr->queue.empty())
-                                return; // Conditions to let the thread go.
-                            task = std::move(ptr->queue.front());
-                            ptr->queue.pop();
+                        if (ptr->queue.empty()) {
+                            if (ptr->shutdown.load(std::memory_order_acquire))
+                                break;
+                            std::this_thread::yield(); // Reduce CPU usage
+                            continue;
                         }
-                        // >>> Critical region => End
-                        task();
-                        if (ptr->to_finish.fetch_add(-1) == 1)
-                            ptr->wait_cv.notify_one();
+
+                        task_container_base* task;
+                        ptr->queue.pop(task);
+                        (*task)();
+                        ptr->to_finish.fetch_sub(1, std::memory_order_release);
+                        
+                        std::this_thread::yield(); // Reduce CPU usage
                     }
                 },
                 m_shared_src)
@@ -81,39 +87,34 @@ static_pool::static_pool(std::size_t sz)
     }
 }
 
-void static_pool::wait() {
-    std::unique_lock<std::mutex> lock(m_shared_src->wait_mu);
-    m_shared_src->wait_cv.wait(
-            lock, [this] { return m_shared_src->to_finish.load() == 0; });
+inline bool static_pool::wait(const std::shared_ptr<pool_src> &ptr) {
+    if (!ptr) {
+        return false;
+    }
+
+    while (ptr->to_finish.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
 }
 
 template<typename Func, typename... Args>
 auto static_pool::enqueue(Func &&f, Args &&... args)
 -> std::future<typename std::result_of<Func(Args...)>::type> {
     using return_type = typename std::result_of<Func(Args...)>::type;
-    std::packaged_task<return_type()> *task = nullptr;
-    try_allocate(task, std::forward<Func>(f), std::forward<Args>(args)...);
+
+    // std::packaged_task<return_type()> *task = nullptr;
+    // try_allocate(task, std::forward<Func>(f), std::forward<Args>(args)...);
+    auto task = new typename std::packaged_task<return_type()>(std::bind(std::forward<Func>(f), std::forward<Args>(args)...));
     auto result = task->get_future();
-    {
-        // Critical region.
-        std::lock_guard<std::mutex> lock(m_shared_src->queue_mu);
-        m_shared_src->queue.push([task]() {
-            (*task)();
-            delete task;
-        });
-    }
-    m_shared_src->to_finish.fetch_add(1);
-    m_shared_src->cv.notify_one();
+    auto container = new task_container<std::packaged_task<return_type()>>(task);
+
+    m_shared_src->queue.push(container);
+    m_shared_src->to_finish.fetch_add(1, std::memory_order_release);
     return result;
 }
 
 static_pool::~static_pool() {
-    {
-        std::lock_guard<std::mutex> lock(m_shared_src->queue_mu);
-        m_shared_src->shutdown = true;
-    }
-    std::atomic_signal_fence(std::memory_order_seq_cst);
-    m_shared_src->cv.notify_all();
+    m_shared_src->shutdown = true;
 }
 
 } // namespace thread_pool
